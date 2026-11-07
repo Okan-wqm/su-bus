@@ -12,6 +12,7 @@ fn fast() -> ClientConfig {
         response_timeout: Duration::from_millis(300),
         connect_timeout: Duration::from_millis(500),
         broadcast_delay: Duration::from_millis(20),
+        ..Default::default()
     }
 }
 
@@ -162,6 +163,7 @@ async fn tcp_max_sessions_evicts_oldest() {
     let cfg = TcpServerConfig {
         max_sessions: 1,
         idle_timeout: None,
+        ..Default::default()
     };
     let server = spawn_tcp_server("127.0.0.1:0", handlers, cfg)
         .await
@@ -237,7 +239,7 @@ async fn rtu_server_answers_unknown_function_after_silence() {
     tokio::spawn(serve_rtu(server_side, handlers, RtuServerConfig::default()));
 
     let mut req = Vec::new();
-    encode_rtu(1, &[0x2B, 0x0E, 0x01, 0x00], &mut req);
+    encode_rtu(1, &[0x41, 0x0E, 0x01, 0x00], &mut req);
     raw.write_all(&req).await.unwrap();
 
     let mut resp = [0u8; 5];
@@ -246,7 +248,7 @@ async fn rtu_server_answers_unknown_function_after_silence() {
         .unwrap()
         .unwrap();
     let mut expected = Vec::new();
-    encode_rtu(1, &[0xAB, 0x01], &mut expected);
+    encode_rtu(1, &[0xC1, 0x01], &mut expected);
     assert_eq!(resp.as_slice(), expected.as_slice());
 }
 

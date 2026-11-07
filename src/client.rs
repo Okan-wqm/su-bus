@@ -1,9 +1,14 @@
 //! Async Modbus client (master).
 
+use crate::codec::{self, RegisterOrder, RegisterValue};
+use crate::device_id::{DeviceIdCode, DeviceIdReport, DeviceIdentification};
 use crate::error::{Error, ProtocolError};
 use crate::frame::{encode_mbap, encode_rtu, read_mbap, Framing, MbapRead, RtuBuffer};
-use crate::pdu::{response_len, Request, Response};
+use crate::pdu::{response_len_for, response_needs_silence, Request, Response};
+use crate::trace::{self, Direction, FrameTrace};
 use crate::types::{AddressRange, UnitId};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,6 +25,16 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Serial only: pause after a broadcast so slaves can process it before the next request.
     pub broadcast_delay: Duration,
+    /// How often a request is repeated after a timeout or a connection failure
+    /// (0 = never). Exceptions and protocol errors are never retried.
+    pub retries: u32,
+    /// Pause between retries.
+    pub retry_delay: Duration,
+    /// RTU only: line silence that ends a response whose length cannot be predicted
+    /// (custom function codes).
+    pub rtu_frame_gap: Duration,
+    /// Called with every sent / received frame.
+    pub trace: Option<FrameTrace>,
 }
 
 impl Default for ClientConfig {
@@ -28,17 +43,25 @@ impl Default for ClientConfig {
             response_timeout: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(3),
             broadcast_delay: Duration::from_millis(100),
+            retries: 0,
+            retry_delay: Duration::from_millis(50),
+            rtu_frame_gap: Duration::from_millis(50),
+            trace: None,
         }
     }
 }
 
-trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+/// A boxed byte stream the client talks over.
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
+type ConnectFuture = Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Stream>>> + Send>>;
+type Connector = Arc<dyn Fn() -> ConnectFuture + Send + Sync>;
 
 struct Session {
     framing: Framing,
-    /// Address to (re)connect to; `None` for user-supplied streams.
-    endpoint: Option<String>,
+    /// Opens a fresh stream; `None` for a one-shot user-supplied stream.
+    connector: Option<Connector>,
     stream: Option<Box<dyn Stream>>,
     transaction: u16,
     rtu: RtuBuffer,
@@ -58,12 +81,29 @@ pub struct Client {
 impl Client {
     /// Modbus TCP client (MBAP framing) for `addr`, e.g. `"192.168.1.10:502"`.
     pub fn tcp(addr: impl Into<String>, config: ClientConfig) -> Client {
-        Self::new(Framing::Tcp, Some(addr.into()), None, config)
+        Self::new(Framing::Tcp, Some(tcp_connector(addr.into())), None, config)
     }
 
     /// RTU framing over a TCP socket (serial-to-Ethernet gateways in transparent mode).
     pub fn rtu_over_tcp(addr: impl Into<String>, config: ClientConfig) -> Client {
-        Self::new(Framing::Rtu, Some(addr.into()), None, config)
+        Self::new(Framing::Rtu, Some(tcp_connector(addr.into())), None, config)
+    }
+
+    /// A client that opens its stream with `connect` (lazily, and again after every failure).
+    ///
+    /// Use it for transports this crate does not open itself: TLS (Modbus/TCP Security),
+    /// a serial port that should be re-opened after a USB adapter is unplugged, etc.
+    pub fn with_connector<F, Fut, S>(framing: Framing, config: ClientConfig, connect: F) -> Client
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<S>> + Send + 'static,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let connector: Connector = Arc::new(move || {
+            let fut = connect();
+            Box::pin(async move { Ok(Box::new(fut.await?) as Box<dyn Stream>) })
+        });
+        Self::new(framing, Some(connector), None, config)
     }
 
     /// Use any byte stream, e.g. a serial port from `tokio-serial` with [`Framing::Rtu`].
@@ -77,14 +117,14 @@ impl Client {
 
     fn new(
         framing: Framing,
-        endpoint: Option<String>,
+        connector: Option<Connector>,
         stream: Option<Box<dyn Stream>>,
         config: ClientConfig,
     ) -> Client {
         Client {
             session: Arc::new(Mutex::new(Session {
                 framing,
-                endpoint,
+                connector,
                 stream,
                 transaction: 0,
                 rtu: RtuBuffer::new(),
@@ -113,7 +153,16 @@ impl Client {
                 "unit 0 is the serial broadcast address; use Client::broadcast",
             ));
         }
-        session.transact(unit, request).await
+        let mut attempt = 0;
+        loop {
+            let result = session.transact(unit, request).await;
+            let retryable = matches!(result, Err(Error::Timeout) | Err(Error::Io(_)));
+            if !retryable || attempt >= session.config.retries {
+                return result;
+            }
+            attempt += 1;
+            tokio::time::sleep(session.config.retry_delay).await;
+        }
     }
 
     /// Serial-line broadcast (unit 0) of a write request. No response is expected.
@@ -283,6 +332,212 @@ impl Client {
     }
 }
 
+impl Client {
+    /// FC 0x07: the eight exception status bits of a serial device.
+    pub async fn read_exception_status(&self, unit: UnitId) -> Result<u8, Error> {
+        match self.request(unit, &Request::ReadExceptionStatus).await? {
+            Response::ReadExceptionStatus(v) => Ok(v),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// FC 0x08 with any sub-function; returns the response data words.
+    pub async fn diagnostics(
+        &self,
+        unit: UnitId,
+        sub_function: u16,
+        data: &[u16],
+    ) -> Result<Vec<u16>, Error> {
+        let req = Request::Diagnostics {
+            sub_function,
+            data: data.to_vec(),
+        };
+        match self.request(unit, &req).await? {
+            Response::Diagnostics { data, .. } => Ok(data),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Diagnostics "return query data": a loopback test of the whole link.
+    pub async fn loopback(&self, unit: UnitId, data: &[u16]) -> Result<(), Error> {
+        self.diagnostics(unit, 0x0000, data).await.map(drop)
+    }
+
+    /// FC 0x0B: `(status, event_count)`.
+    pub async fn get_comm_event_counter(&self, unit: UnitId) -> Result<(u16, u16), Error> {
+        match self.request(unit, &Request::GetCommEventCounter).await? {
+            Response::GetCommEventCounter {
+                status,
+                event_count,
+            } => Ok((status, event_count)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// FC 0x11: device-specific identification bytes.
+    pub async fn report_server_id(&self, unit: UnitId) -> Result<Vec<u8>, Error> {
+        match self.request(unit, &Request::ReportServerId).await? {
+            Response::ReportServerId(v) => Ok(v),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// FC 0x18: the content of the FIFO queue at `address`.
+    pub async fn read_fifo_queue(&self, unit: UnitId, address: u16) -> Result<Vec<u16>, Error> {
+        match self
+            .request(unit, &Request::ReadFifoQueue { address })
+            .await?
+        {
+            Response::ReadFifoQueue(v) => Ok(v),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// FC 0x2B / 0x0E stream access: collects every object of the category, following
+    /// "more follows" across as many requests as needed.
+    pub async fn read_device_identification(
+        &self,
+        unit: UnitId,
+        code: DeviceIdCode,
+    ) -> Result<DeviceIdReport, Error> {
+        if code == DeviceIdCode::Specific {
+            return Err(Error::InvalidRequest(
+                "use read_device_identification_object for individual access",
+            ));
+        }
+        let mut identification = DeviceIdentification::default();
+        let mut object_id = 0u8;
+        // At most 256 objects exist, and each response must advance.
+        for _ in 0..=256 {
+            let req = Request::ReadDeviceIdentification { code, object_id };
+            let Response::ReadDeviceIdentification(resp) = self.request(unit, &req).await? else {
+                return Err(unexpected());
+            };
+            let conformity_level = resp.conformity_level;
+            for (id, value) in resp.objects {
+                identification.insert(id, value);
+            }
+            if !resp.more_follows {
+                return Ok(DeviceIdReport {
+                    conformity_level,
+                    identification,
+                });
+            }
+            if resp.next_object_id <= object_id {
+                return Err(ProtocolError::Malformed("next object id does not advance").into());
+            }
+            object_id = resp.next_object_id;
+        }
+        Err(ProtocolError::Malformed("device identification never ends").into())
+    }
+
+    /// FC 0x2B / 0x0E individual access: one object's value.
+    pub async fn read_device_identification_object(
+        &self,
+        unit: UnitId,
+        object_id: u8,
+    ) -> Result<Vec<u8>, Error> {
+        let req = Request::ReadDeviceIdentification {
+            code: DeviceIdCode::Specific,
+            object_id,
+        };
+        match self.request(unit, &req).await? {
+            Response::ReadDeviceIdentification(mut r) => Ok(r.objects.remove(0).1),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Send a raw request with any function code and return the raw response data.
+    pub async fn custom(&self, unit: UnitId, function: u8, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let req = Request::Custom {
+            function,
+            data: data.to_vec(),
+        };
+        match self.request(unit, &req).await? {
+            Response::Custom { data, .. } => Ok(data),
+            _ => Err(unexpected()),
+        }
+    }
+
+    // ---- typed values ------------------------------------------------------
+
+    /// Read one `f32` / `u32` / `i64` / ... from holding registers.
+    pub async fn read_holding<T: RegisterValue>(
+        &self,
+        unit: UnitId,
+        address: u16,
+        order: RegisterOrder,
+    ) -> Result<T, Error> {
+        Ok(self
+            .read_holding_values::<T>(unit, address, 1, order)
+            .await?[0])
+    }
+
+    /// Read `count` consecutive typed values from holding registers.
+    pub async fn read_holding_values<T: RegisterValue>(
+        &self,
+        unit: UnitId,
+        address: u16,
+        count: u16,
+        order: RegisterOrder,
+    ) -> Result<Vec<T>, Error> {
+        let words = typed_words::<T>(count)?;
+        let regs = self.read_holding_registers(unit, address, words).await?;
+        codec::decode_all(&regs, order).ok_or_else(unexpected)
+    }
+
+    /// Read one typed value from input registers.
+    pub async fn read_input<T: RegisterValue>(
+        &self,
+        unit: UnitId,
+        address: u16,
+        order: RegisterOrder,
+    ) -> Result<T, Error> {
+        Ok(self.read_input_values::<T>(unit, address, 1, order).await?[0])
+    }
+
+    /// Read `count` consecutive typed values from input registers.
+    pub async fn read_input_values<T: RegisterValue>(
+        &self,
+        unit: UnitId,
+        address: u16,
+        count: u16,
+        order: RegisterOrder,
+    ) -> Result<Vec<T>, Error> {
+        let words = typed_words::<T>(count)?;
+        let regs = self.read_input_registers(unit, address, words).await?;
+        codec::decode_all(&regs, order).ok_or_else(unexpected)
+    }
+
+    /// Write typed values to consecutive holding registers (FC 0x10).
+    pub async fn write_holding_values<T: RegisterValue>(
+        &self,
+        unit: UnitId,
+        address: u16,
+        values: &[T],
+        order: RegisterOrder,
+    ) -> Result<(), Error> {
+        let regs = codec::encode_all(values, order);
+        self.write_multiple_registers(unit, address, &regs).await
+    }
+}
+
+fn typed_words<T: RegisterValue>(count: u16) -> Result<u16, Error> {
+    u16::try_from(count as usize * T::WORDS).map_err(|_| Error::InvalidRequest("too many values"))
+}
+
+fn tcp_connector(addr: String) -> Connector {
+    let addr = Arc::new(addr);
+    Arc::new(move || {
+        let addr = addr.clone();
+        Box::pin(async move {
+            let stream = TcpStream::connect(addr.as_str()).await?;
+            stream.set_nodelay(true)?;
+            Ok(Box::new(stream) as Box<dyn Stream>)
+        })
+    })
+}
+
 fn unexpected() -> Error {
     Error::Protocol(ProtocolError::BadLength)
 }
@@ -292,17 +547,13 @@ impl Session {
         if self.stream.is_some() {
             return Ok(());
         }
-        let Some(addr) = &self.endpoint else {
+        let Some(connector) = &self.connector else {
             return Err(Error::NoConnection);
         };
-        let stream = timeout(
-            self.config.connect_timeout,
-            TcpStream::connect(addr.as_str()),
-        )
-        .await
-        .map_err(|_| Error::Timeout)??;
-        stream.set_nodelay(true)?;
-        self.stream = Some(Box::new(stream));
+        let stream = timeout(self.config.connect_timeout, connector())
+            .await
+            .map_err(|_| Error::Timeout)??;
+        self.stream = Some(stream);
         self.rtu.clear();
         Ok(())
     }
@@ -324,6 +575,7 @@ impl Session {
     }
 
     async fn write_frame(&mut self) -> Result<(), Error> {
+        trace::emit(&self.config.trace, Direction::Tx, &self.tx_buf);
         let stream = self.stream.as_mut().ok_or(Error::NoConnection)?;
         stream.write_all(&self.tx_buf).await?;
         stream.flush().await?;
@@ -349,6 +601,11 @@ impl Session {
                     MbapRead::Invalid(e) => return Err(e.into()),
                 },
             };
+            if self.config.trace.is_some() {
+                let mut raw = Vec::with_capacity(frame.pdu.len() + 7);
+                encode_mbap(frame.transaction, frame.unit, &frame.pdu, &mut raw);
+                trace::emit(&self.config.trace, Direction::Rx, &raw);
+            }
             if frame.transaction != tx {
                 // Late answer to an earlier (timed-out) request: ignore it.
                 continue;
@@ -389,17 +646,33 @@ impl Session {
         encode_rtu(unit.0, &pdu, &mut self.tx_buf);
         self.write_frame().await?;
 
+        // Some responses (custom function codes, device-specific diagnostics) have no
+        // predictable length: their end is line silence.
+        let by_silence = response_needs_silence(request);
+        let predict = |p: &[u8]| response_len_for(request, p);
         let deadline = Instant::now() + self.config.response_timeout;
         let mut scratch = [0u8; 256];
         loop {
-            while let Some(frame) = self.rtu.next_frame(response_len, true) {
-                if frame.unit == unit.0 {
-                    return Response::decode(request, &frame.pdu);
+            while let Some(frame) = self.rtu.next_frame(&predict, !by_silence) {
+                if let Some(r) = self.accept_rtu(unit, request, frame) {
+                    return r;
                 }
-                // Another station's traffic (or echo on a 2-wire bus): ignore.
             }
+            let gap_deadline = if by_silence && !self.rtu.is_empty() {
+                deadline.min(Instant::now() + self.config.rtu_frame_gap)
+            } else {
+                deadline
+            };
             let stream = self.stream.as_mut().ok_or(Error::NoConnection)?;
-            let n = match timeout_at(deadline, stream.read(&mut scratch)).await {
+            let n = match timeout_at(gap_deadline, stream.read(&mut scratch)).await {
+                Err(_) if gap_deadline < deadline => {
+                    if let Some(frame) = self.rtu.take_on_silence() {
+                        if let Some(r) = self.accept_rtu(unit, request, frame) {
+                            return r;
+                        }
+                    }
+                    continue;
+                }
                 Err(_) => return Err(Error::Timeout),
                 Ok(r) => r?,
             };
@@ -408,6 +681,22 @@ impl Session {
             }
             self.rtu.extend(&scratch[..n]);
         }
+    }
+
+    /// `Some` when `frame` is the answer we wait for.
+    fn accept_rtu(
+        &self,
+        unit: UnitId,
+        request: &Request,
+        frame: crate::frame::RtuFrame,
+    ) -> Option<Result<Response, Error>> {
+        if self.config.trace.is_some() {
+            let mut raw = Vec::with_capacity(frame.pdu.len() + 3);
+            encode_rtu(frame.unit, &frame.pdu, &mut raw);
+            trace::emit(&self.config.trace, Direction::Rx, &raw);
+        }
+        // Another station's traffic (or our own echo on a 2-wire bus) is ignored.
+        (frame.unit == unit.0).then(|| Response::decode(request, &frame.pdu))
     }
 
     async fn send_broadcast(&mut self, request: &Request) -> Result<(), Error> {

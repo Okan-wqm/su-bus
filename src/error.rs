@@ -35,6 +35,8 @@ pub enum ProtocolError {
     BadByteCount,
     /// A write response does not echo the request.
     EchoMismatch,
+    /// A field holds a value the specification does not allow.
+    Malformed(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -64,6 +66,7 @@ impl fmt::Display for ProtocolError {
             Self::BadLength => f.write_str("bad PDU length"),
             Self::BadByteCount => f.write_str("byte count does not match quantity"),
             Self::EchoMismatch => f.write_str("write response does not echo the request"),
+            Self::Malformed(what) => write!(f, "malformed field: {what}"),
         }
     }
 }

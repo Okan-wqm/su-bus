@@ -129,6 +129,8 @@ pub(crate) struct RtuBuffer {
     /// True when `buf` starts at a frame boundary (start, after a frame, after silence).
     /// False while resynchronising after garbage.
     at_boundary: bool,
+    /// Frames that lined up at a boundary but failed the CRC check.
+    crc_errors: u32,
 }
 
 impl Default for RtuBuffer {
@@ -136,6 +138,7 @@ impl Default for RtuBuffer {
         RtuBuffer {
             buf: Vec::new(),
             at_boundary: true,
+            crc_errors: 0,
         }
     }
 }
@@ -154,6 +157,11 @@ impl RtuBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+
+    /// Return and reset the number of CRC errors seen since the last call.
+    pub fn take_crc_errors(&mut self) -> u32 {
+        std::mem::take(&mut self.crc_errors)
     }
 
     pub fn clear(&mut self) {
@@ -184,7 +192,7 @@ impl RtuBuffer {
     /// until line silence (server side: we may still want to answer "illegal function").
     pub fn next_frame(
         &mut self,
-        predict: fn(&[u8]) -> PduLen,
+        predict: &dyn Fn(&[u8]) -> PduLen,
         skip_unknown: bool,
     ) -> Option<RtuFrame> {
         loop {
@@ -206,6 +214,9 @@ impl RtuBuffer {
                         self.buf.drain(..total);
                         self.at_boundary = true;
                         return Some(frame);
+                    }
+                    if self.at_boundary {
+                        self.crc_errors += 1;
                     }
                     self.skip_byte();
                 }
@@ -232,6 +243,10 @@ impl RtuBuffer {
                 pdu: self.buf[1..self.buf.len() - 2].to_vec(),
             })
         } else {
+            // While resynchronising, the error was already counted when it was detected.
+            if !self.buf.is_empty() && self.at_boundary {
+                self.crc_errors += 1;
+            }
             None
         };
         self.clear();
@@ -281,7 +296,7 @@ mod tests {
         let mut frames = Vec::new();
         for b in stream {
             rb.extend(&[b]);
-            while let Some(f) = rb.next_frame(request_len, false) {
+            while let Some(f) = rb.next_frame(&request_len, false) {
                 frames.push(f);
             }
         }
@@ -298,13 +313,16 @@ mod tests {
         encode_rtu(5, &[0x83, 0x02], &mut f);
         let mut rb = RtuBuffer::new();
         rb.extend(&f);
-        assert_eq!(rb.next_frame(response_len, true).unwrap().pdu, [0x83, 0x02]);
+        assert_eq!(
+            rb.next_frame(&response_len, true).unwrap().pdu,
+            [0x83, 0x02]
+        );
 
         // unknown function code: only recoverable on silence
         let mut f = Vec::new();
-        encode_rtu(5, &[0x2B, 0x0E, 0x01, 0x00], &mut f);
+        encode_rtu(5, &[0x41, 0x0E, 0x01, 0x00], &mut f);
         rb.extend(&f);
-        assert!(rb.next_frame(request_len, false).is_none());
-        assert_eq!(rb.take_on_silence().unwrap().pdu, [0x2B, 0x0E, 0x01, 0x00]);
+        assert!(rb.next_frame(&request_len, false).is_none());
+        assert_eq!(rb.take_on_silence().unwrap().pdu, [0x41, 0x0E, 0x01, 0x00]);
     }
 }
