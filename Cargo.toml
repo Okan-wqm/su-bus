@@ -1,0 +1,12 @@
+[package]
+name = "su-bus"
+version = "0.1.0"
+edition = "2021"
+description = "Async Modbus (TCP / RTU / RTU-over-TCP) client and server, written clean-room from the public Modbus specification"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
